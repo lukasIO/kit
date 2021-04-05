@@ -43,3 +43,4 @@ Adding a `rel=external` attribute to a link...
 ```
 
 ...will trigger a browser navigation when the link is clicked.
+The same behaviour applies if you set the `rel` attribute to either `noopener` or `noreferrer` as those values imply external navigation.

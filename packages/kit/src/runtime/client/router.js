@@ -118,8 +118,17 @@ export class Router {
 
 			// Ignore if tag has
 			// 1. 'download' attribute
-			// 2. rel='external' attribute
-			if (a.hasAttribute('download') || a.getAttribute('rel') === 'external') return;
+			// 2. rel attribute is set to either 'external', 'noopener' or 'noreferrer'
+			const rel = a.getAttribute('rel');
+
+			if (
+				a.hasAttribute('download') ||
+				rel === 'external' ||
+				rel === 'noopener' ||
+				rel === 'noreferrer'
+			) {
+				return;
+			}
 
 			// Ignore if <a> has a target
 			if (svg ? /** @type {SVGAElement} */ (a).target.baseVal : a.target) return;
