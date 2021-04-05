@@ -118,14 +118,14 @@ export class Router {
 
 			// Ignore if tag has
 			// 1. 'download' attribute
-			// 2. rel attribute is set to either 'external', 'noopener' or 'noreferrer'
-			const rel = a.getAttribute('rel');
+			// 2. rel attribute contains either 'external', 'noopener' or 'noreferrer'
+			const rel = a.getAttribute('rel').split(' ');
 
 			if (
 				a.hasAttribute('download') ||
-				rel === 'external' ||
-				rel === 'noopener' ||
-				rel === 'noreferrer'
+				rel.includes('external') ||
+				rel.includes('noopener') ||
+				rel.includes('noreferrer')
 			) {
 				return;
 			}
