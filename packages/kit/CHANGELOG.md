@@ -1,5 +1,11 @@
 # @sveltejs/kit
 
+## 1.0.0-next.68
+
+### Patch Changes
+
+- ba4f9b7: Check port, only expose to network with --host flag
+
 ## 1.0.0-next.67
 
 ### Patch Changes
