@@ -1,4 +1,3 @@
-import http from 'http';
 import fs from 'fs';
 import path from 'path';
 import { parse, URLSearchParams } from 'url';
@@ -13,8 +12,9 @@ import { ssr } from '../../runtime/server/index.js';
 import { get_body } from '../http/index.js';
 import { copy_assets } from '../utils.js';
 import svelte from '@sveltejs/vite-plugin-svelte';
+import { get_server } from '../server/index.js';
 
-/** @typedef {{ cwd?: string, port: number, host: string, config: import('../../../types.internal').ValidatedConfig }} Options */
+/** @typedef {{ cwd?: string, port: number, host: string, https: boolean, config: import('../../../types.internal').ValidatedConfig }} Options */
 /** @typedef {import('../../../types.internal').SSRComponent} SSRComponent */
 
 /** @param {Options} opts */
@@ -24,7 +24,7 @@ export function dev(opts) {
 
 class Watcher extends EventEmitter {
 	/** @param {Options} opts */
-	constructor({ cwd = process.cwd(), port, host, config }) {
+	constructor({ cwd = process.cwd(), port, host, https, config }) {
 		super();
 
 		this.cwd = cwd;
@@ -32,6 +32,7 @@ class Watcher extends EventEmitter {
 
 		this.port = port;
 		this.host = host;
+		this.https = https;
 		this.config = config;
 
 		process.env.NODE_ENV = 'development';
@@ -80,7 +81,7 @@ class Watcher extends EventEmitter {
 		/**
 		 * @type {vite.ViteDevServer}
 		 */
-		this.viteDevServer = await vite.createServer({
+		this.vite = await vite.createServer({
 			...user_config,
 			configFile: false,
 			root: this.cwd,
@@ -113,8 +114,21 @@ class Watcher extends EventEmitter {
 
 		const validator = this.config.kit.amp && (await amp_validator.getInstance());
 
-		this.server = http.createServer((req, res) => {
-			this.viteDevServer.middlewares(req, res, async () => {
+		/**
+		 * @param {import('vite').ModuleNode} node
+		 * @param {Set<import('vite').ModuleNode>} deps
+		 */
+		const find_deps = (node, deps) => {
+			for (const dep of node.importedModules) {
+				if (!deps.has(dep)) {
+					deps.add(dep);
+					find_deps(dep, deps);
+				}
+			}
+		};
+
+		this.server = await get_server(this.port, this.host, this.https, (req, res) => {
+			this.vite.middlewares(req, res, async () => {
 				try {
 					const parsed = parse(req.url);
 
@@ -123,15 +137,14 @@ class Watcher extends EventEmitter {
 					// handle dynamic requests - i.e. pages and endpoints
 					const template = fs.readFileSync(this.config.kit.files.template, 'utf-8');
 
-					const hooks = /** @type {import('../../../types.internal').Hooks} */ (await this.viteDevServer
+					const hooks = /** @type {import('../../../types.internal').Hooks} */ (await this.vite
 						.ssrLoadModule(`/${this.config.kit.files.hooks}`)
 						.catch(() => ({})));
 
 					let root;
 
 					try {
-						root = (await this.viteDevServer.ssrLoadModule(`/${this.dir}/generated/root.svelte`))
-							.default;
+						root = (await this.vite.ssrLoadModule(`/${this.dir}/generated/root.svelte`)).default;
 					} catch (e) {
 						res.statusCode = 500;
 						res.end(e.stack);
@@ -206,6 +219,44 @@ class Watcher extends EventEmitter {
 								return rendered;
 							},
 							manifest: this.manifest,
+							load_component: async (id) => {
+								// if (id === 'layout') id = this.manifest.layout;
+								// if (id === 'error') id = this.manifest.error;
+
+								const url = path.resolve(this.cwd, id);
+
+								const module = /** @type {SSRComponent} */ (await this.vite.ssrLoadModule(url));
+								const node = await this.vite.moduleGraph.getModuleByUrl(url);
+
+								const deps = new Set();
+								find_deps(node, deps);
+
+								const css = new Set();
+								const styles = new Set();
+
+								for (const dep of deps) {
+									// TODO what about .scss files, etc?
+									if (dep.file.endsWith('.css')) {
+										try {
+											const mod = await this.vite.ssrLoadModule(dep.url);
+											css.add(dep.url);
+											styles.add(mod.default);
+										} catch {
+											// this can happen with dynamically imported modules, I think
+											// because the Vite module graph doesn't distinguish between
+											// static and dynamic imports? TODO investigate, submit fix
+										}
+									}
+								}
+
+								return {
+									module,
+									entry: `/${id}?import`,
+									css: Array.from(css),
+									js: [],
+									styles: Array.from(styles)
+								};
+							},
 							target: this.config.kit.target,
 							entry: '/.svelte/dev/runtime/internal/start.js',
 							dev: true,
@@ -217,14 +268,14 @@ class Watcher extends EventEmitter {
 								handle: hooks.handle || ((request, render) => render(request))
 							},
 							only_render_prerenderable_pages: false,
-							get_component_path: (id) => `/${id}?import`,
+							// get_component_path: (id) => `/${id}?import`,
 							get_stack: (error) => {
-								this.viteDevServer.ssrFixStacktrace(error);
+								this.vite.ssrFixStacktrace(error);
 								return error.stack;
 							},
 							get_static_file: (file) =>
 								fs.readFileSync(path.join(this.config.kit.files.assets, file)),
-							get_amp_css: (url) => '', // TODO: implement this
+							// get_amp_css: (url) => '', // TODO: implement this
 							ssr: this.config.kit.ssr,
 							router: this.config.kit.router,
 							hydrate: this.config.kit.hydrate
@@ -239,13 +290,11 @@ class Watcher extends EventEmitter {
 						res.end('Not found');
 					}
 				} catch (e) {
-					this.viteDevServer.ssrFixStacktrace(e);
+					this.vite.ssrFixStacktrace(e);
 					res.end(e.stack);
 				}
 			});
 		});
-
-		this.server.listen(this.port, this.host || '0.0.0.0');
 	}
 
 	update() {
@@ -261,103 +310,18 @@ class Watcher extends EventEmitter {
 			cwd: this.cwd
 		});
 
-		const common_css_deps = new Set();
-
-		/**
-		 * @param {string} file
-		 * @returns {Promise<{
-		 *   mod: SSRComponent;
-		 *   css: Set<string>;
-		 * }>}
-		 */
-		const load = async (file) => {
-			const url = path.resolve(this.cwd, file);
-
-			const mod = /** @type {SSRComponent} */ (await this.viteDevServer.ssrLoadModule(url));
-			const node = await this.viteDevServer.moduleGraph.getModuleByUrl(url);
-
-			const deps = new Set();
-			find_deps(node, deps);
-
-			const css = new Set();
-			for (const dep of deps) {
-				// TODO what about .scss files, etc?
-				if (dep.file.endsWith('.css')) {
-					try {
-						const mod = await this.viteDevServer.ssrLoadModule(dep.url);
-						css.add(mod.default);
-					} catch {
-						// this can happen with dynamically imported modules, I think
-						// because the Vite module graph doesn't distinguish between
-						// static and dynamic imports? TODO investigate, submit fix
-					}
-				}
-			}
-
-			return { mod, css };
-		};
-
-		/**
-		 * @param {import('vite').ModuleNode} node
-		 * @param {Set<import('vite').ModuleNode>} deps
-		 */
-		const find_deps = (node, deps) => {
-			for (const dep of node.importedModules) {
-				if (!deps.has(dep)) {
-					deps.add(dep);
-					find_deps(dep, deps);
-				}
-			}
-		};
-
 		/** @type {import('../../../types.internal').SSRManifest} */
 		this.manifest = {
 			assets: manifest_data.assets,
-			layout: async () => {
-				const { mod, css } = await load(manifest_data.layout);
-				css.forEach((mod) => {
-					common_css_deps.add(mod);
-				});
-				return mod;
-			},
-			error: async () => {
-				const { mod, css } = await load(manifest_data.error);
-				css.forEach((mod) => {
-					common_css_deps.add(mod);
-				});
-				return mod;
-			},
+			layout: manifest_data.layout,
+			error: manifest_data.error,
 			routes: manifest_data.routes.map((route) => {
 				if (route.type === 'page') {
-					// This is a bit of a hack, but it means we can inject the correct <style>
-					// contents without needing to do any analysis before loading
-					const css_deps = new Set();
-
 					return {
 						type: 'page',
 						pattern: route.pattern,
 						params: get_params(route.params),
-						parts: route.parts.map((id) => {
-							return {
-								id,
-								async load() {
-									const { mod, css } = await load(id);
-
-									css.forEach((mod) => {
-										css_deps.add(mod);
-									});
-
-									return mod;
-								}
-							};
-						}),
-						get style() {
-							// TODO is it possible to inject <link> elements with
-							// the current Vite plugin? would be better than this
-							return [...common_css_deps, ...css_deps].join('\n');
-						},
-						css: [],
-						js: []
+						parts: route.parts
 					};
 				}
 
@@ -367,7 +331,7 @@ class Watcher extends EventEmitter {
 					params: get_params(route.params),
 					load: async () => {
 						const url = path.resolve(this.cwd, route.file);
-						return await this.viteDevServer.ssrLoadModule(url);
+						return await this.vite.ssrLoadModule(url);
 					}
 				};
 			})
@@ -378,7 +342,7 @@ class Watcher extends EventEmitter {
 		if (this.closed) return;
 		this.closed = true;
 
-		this.viteDevServer.close();
+		this.vite.close();
 		this.server.close();
 		this.cheapwatch.close();
 	}

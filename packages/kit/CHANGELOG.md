@@ -1,5 +1,34 @@
 # @sveltejs/kit
 
+## 1.0.0-next.71
+
+### Patch Changes
+
+- 108c26c: Always return a response from render function in handle
+
+## 1.0.0-next.70
+
+### Patch Changes
+
+- 6d9f7b1: Only include CSS on an SSR'd page
+- 6ecfa2c: Remove duplicate <style> element
+
+## 1.0.0-next.69
+
+### Patch Changes
+
+- 4d2cd62: Add prerendering to \$app/env
+- e2eeeea: Call load when path changes if page.path is used
+- 50b5526: Pass through credentials when fetching in load
+- 6384af6: Only inline data if hydrate=true
+
+## 1.0.0-next.68
+
+### Patch Changes
+
+- 24fab19: Add --https flag to dev and start
+- ba4f9b7: Check port, only expose to network with --host flag
+
 ## 1.0.0-next.67
 
 ### Patch Changes

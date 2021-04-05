@@ -2,8 +2,8 @@ import devalue from 'devalue';
 import fetch, { Response } from 'node-fetch';
 import { writable } from 'svelte/store';
 import { parse, resolve, URLSearchParams } from 'url';
-import { normalize } from '../load.js';
-import { ssr } from './index.js';
+import { normalize } from '../../load.js';
+import { ssr } from '../index.js';
 
 const s = JSON.stringify;
 
@@ -16,12 +16,9 @@ const s = JSON.stringify;
  *   status: number;
  *   error: Error
  * }} opts
- * @returns {Promise<import('types.internal').ResponseWithDependencies>}
+ * @returns {Promise<import('types').Response>}
  */
-async function get_response({ request, options, $session, route, status = 200, error }) {
-	/** @type {Record<string, import('types.internal').ResponseWithDependencies>} */
-	const dependencies = {};
-
+export async function respond({ request, options, $session, route, status = 200, error }) {
 	const serialized_session = try_serialize($session, (error) => {
 		throw new Error(`Failed to serialize session data: ${error.message}`);
 	});
@@ -80,11 +77,6 @@ async function get_response({ request, options, $session, route, status = 200, e
 
 		const parsed = parse(url);
 
-		// TODO: fix type https://github.com/node-fetch/node-fetch/issues/1113
-		if (opts.credentials !== 'omit') {
-			uses_credentials = true;
-		}
-
 		let response;
 
 		if (parsed.protocol) {
@@ -121,11 +113,24 @@ async function get_response({ request, options, $session, route, status = 200, e
 			}
 
 			if (!response) {
+				const headers = /** @type {import('types.internal').Headers} */ ({ ...opts.headers });
+
+				// TODO: fix type https://github.com/node-fetch/node-fetch/issues/1113
+				if (opts.credentials !== 'omit') {
+					uses_credentials = true;
+
+					headers.cookie = request.headers.cookie;
+
+					if (!headers.authorization) {
+						headers.authorization = request.headers.authorization;
+					}
+				}
+
 				const rendered = await ssr(
 					{
 						host: request.host,
 						method: opts.method || 'GET',
-						headers: /** @type {import('types.internal').Headers} */ (opts.headers || {}), // TODO inject credentials...
+						headers,
 						path: resolved,
 						body: /** @type {any} */ (opts.body),
 						query: new URLSearchParams(parsed.query || '')
@@ -138,9 +143,9 @@ async function get_response({ request, options, $session, route, status = 200, e
 				);
 
 				if (rendered) {
-					// TODO this is primarily for the benefit of the static case,
-					// but could it be used elsewhere?
-					dependencies[resolved] = rendered;
+					if (options.dependencies) {
+						options.dependencies.set(resolved, rendered);
+					}
 
 					response = new Response(rendered.body, {
 						status: rendered.status,
@@ -150,7 +155,7 @@ async function get_response({ request, options, $session, route, status = 200, e
 			}
 		}
 
-		if (response) {
+		if (response && page_config.hydrate) {
 			const proxy = new Proxy(response, {
 				get(response, key, receiver) {
 					async function text() {
@@ -159,7 +164,7 @@ async function get_response({ request, options, $session, route, status = 200, e
 						/** @type {import('types.internal').Headers} */
 						const headers = {};
 						response.headers.forEach((value, key) => {
-							if (key !== 'etag') headers[key] = value;
+							if (key !== 'etag' && key !== 'set-cookie') headers[key] = value;
 						});
 
 						// prettier-ignore
@@ -190,14 +195,20 @@ async function get_response({ request, options, $session, route, status = 200, e
 			return proxy;
 		}
 
-		return new Response('Not found', {
-			status: 404
-		});
+		return (
+			response ||
+			new Response('Not found', {
+				status: 404
+			})
+		);
 	};
 
 	const component_promises = error
-		? [options.manifest.layout()]
-		: [options.manifest.layout(), ...route.parts.map((part) => part.load())];
+		? [options.load_component(options.manifest.layout)]
+		: [
+				options.load_component(options.manifest.layout),
+				...route.parts.map((id) => options.load_component(id))
+		  ];
 
 	const components = [];
 	const props_promises = [];
@@ -210,9 +221,9 @@ async function get_response({ request, options, $session, route, status = 200, e
 	try {
 		page_component = error
 			? { ssr: options.ssr, router: options.router, hydrate: options.hydrate }
-			: await component_promises[component_promises.length - 1];
+			: (await component_promises[component_promises.length - 1]).module;
 	} catch (e) {
-		return await get_response({
+		return await respond({
 			request,
 			options,
 			$session,
@@ -229,11 +240,23 @@ async function get_response({ request, options, $session, route, status = 200, e
 	};
 
 	if (options.only_render_prerenderable_pages) {
-		if (error) return; // don't prerender an error page
+		if (error) {
+			return {
+				status,
+				headers: {},
+				body: error.message
+			};
+		}
 
 		// if the page has `export const prerender = true`, continue,
 		// otherwise bail out at this point
-		if (!page_component.prerender) return;
+		if (!page_component.prerender) {
+			return {
+				status: 204,
+				headers: {},
+				body: null
+			};
+		}
 	}
 
 	/** @type {{ head: string, html: string, css: string }} */
@@ -244,17 +267,11 @@ async function get_response({ request, options, $session, route, status = 200, e
 			let loaded;
 
 			try {
-				const mod = await component_promises[i];
-				components[i] = mod.default;
+				const { module } = await component_promises[i];
+				components[i] = module.default;
 
-				if (mod.preload) {
-					throw new Error(
-						'preload has been deprecated in favour of load. Please consult the documentation: https://kit.svelte.dev/docs#loading'
-					);
-				}
-
-				if (mod.load) {
-					loaded = await mod.load.call(null, {
+				if (module.load) {
+					loaded = await module.load.call(null, {
 						page,
 						get session() {
 							uses_credentials = true;
@@ -264,7 +281,7 @@ async function get_response({ request, options, $session, route, status = 200, e
 						context: { ...context }
 					});
 
-					if (!loaded && mod === page_component) return;
+					if (!loaded && module === page_component) return;
 				}
 			} catch (e) {
 				// if load fails when we're already rendering the
@@ -283,7 +300,7 @@ async function get_response({ request, options, $session, route, status = 200, e
 				// TODO there's some logic that's duplicated in the client runtime,
 				// it would be nice to DRY it out if possible
 				if (loaded.error) {
-					return await get_response({
+					return await respond({
 						request,
 						options,
 						$session,
@@ -355,7 +372,7 @@ async function get_response({ request, options, $session, route, status = 200, e
 		} catch (e) {
 			if (error) throw e instanceof Error ? e : new Error(e);
 
-			return await get_response({
+			return await respond({
 				request,
 				options,
 				$session,
@@ -363,9 +380,9 @@ async function get_response({ request, options, $session, route, status = 200, e
 				status: 500,
 				error: e instanceof Error ? e : { name: 'Error', message: e.toString() }
 			});
+		} finally {
+			unsubscribe();
 		}
-
-		unsubscribe();
 	} else {
 		rendered = {
 			head: '',
@@ -374,21 +391,28 @@ async function get_response({ request, options, $session, route, status = 200, e
 		};
 	}
 
-	// TODO all the `route &&` stuff is messy
-	const js_deps = route ? route.js : [];
-	const css_deps = route ? route.css : [];
-	const style = route ? route.style : '';
+	const css = new Set();
+	const js = new Set();
+	const styles = new Set();
 
-	const prefix = `${options.paths.assets}/${options.app_dir}`;
+	const nodes = await Promise.all(component_promises);
+
+	if (page_config.ssr) {
+		nodes.forEach((part) => {
+			if (part.css) part.css.forEach((url) => css.add(url));
+			if (part.js) part.js.forEach((url) => js.add(url));
+			if (part.styles) part.styles.forEach((content) => styles.add(content));
+		});
+	}
 
 	// TODO strip the AMP stuff out of the build if not relevant
 	const links = options.amp
-		? `<style amp-custom>${
-				style || (await Promise.all(css_deps.map((dep) => options.get_amp_css(dep)))).join('\n')
-		  }</style>`
+		? styles.size > 0
+			? `<style amp-custom>${Array.from(styles).join('\n')}</style>`
+			: ''
 		: [
-				...js_deps.map((dep) => `<link rel="modulepreload" href="${prefix}/${dep}">`),
-				...css_deps.map((dep) => `<link rel="stylesheet" href="${prefix}/${dep}">`)
+				...Array.from(js).map((dep) => `<link rel="modulepreload" href="${dep}">`),
+				...Array.from(css).map((dep) => `<link rel="stylesheet" href="${dep}">`)
 		  ].join('\n\t\t\t');
 
 	/** @type {string} */
@@ -414,8 +438,8 @@ async function get_response({ request, options, $session, route, status = 200, e
 					status: ${status},
 					error: ${serialize_error(error)},
 					nodes: ${route ? `[
-						${(route ? route.parts : [])
-						.map((part) => `import(${s(options.get_component_path(part.id))})`)
+						${nodes.slice(1) // TODO the slice is temporary
+						.map((node) => `import(${s(node.entry)})`)
 						.join(',\n\t\t\t\t\t\t')}
 					]` : '[]'},
 					page: {
@@ -431,7 +455,9 @@ async function get_response({ request, options, $session, route, status = 200, e
 
 	const head = [
 		rendered.head,
-		style && !options.amp ? `<style data-svelte>${style}</style>` : '',
+		styles.size && !options.amp
+			? `<style data-svelte>${Array.from(styles).join('\n')}</style>`
+			: '',
 		links,
 		init
 	].join('\n\n');
@@ -457,53 +483,8 @@ async function get_response({ request, options, $session, route, status = 200, e
 	return {
 		status,
 		headers,
-		body: options.template({ head, body }),
-		dependencies
+		body: options.template({ head, body })
 	};
-}
-
-/**
- * @param {import('types').Request} request
- * @param {import('types.internal').SSRPage} route
- * @param {import('types.internal').SSRRenderOptions} options
- * @returns {Promise<import('types.internal').ResponseWithDependencies>}
- */
-export default async function render_page(request, route, options) {
-	if (options.initiator === route) {
-		// infinite request cycle detected
-		return {
-			status: 404,
-			headers: {},
-			body: `Not found: ${request.path}`
-		};
-	}
-
-	const $session = await options.hooks.getSession({ context: request.context });
-
-	const response = await get_response({
-		request,
-		options,
-		$session,
-		route,
-		status: route ? 200 : 404,
-		error: route ? null : new Error(`Not found: ${request.path}`)
-	});
-
-	if (response) {
-		return response;
-	}
-
-	if (options.fetched) {
-		// we came here because of a bad request in a `load` function.
-		// rather than render the error page — which could lead to an
-		// infinite loop, if the `load` belonged to the root layout,
-		// we respond with a bare-bones 500
-		return {
-			status: 500,
-			headers: {},
-			body: `Bad request in load function: failed to fetch ${options.fetched}`
-		};
-	}
 }
 
 /**

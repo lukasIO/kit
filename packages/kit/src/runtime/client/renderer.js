@@ -263,14 +263,8 @@ export class Renderer {
 	_init(result) {
 		this.current = result.state;
 
-		// remove dev-mode SSR <style> insert, since it doesn't apply
-		// to hydrated markup (HMR requires hashes to be rewritten)
-		// TODO only in dev
-		// TODO it seems this doesn't always work with the classname
-		// stabilisation in vite-plugin-svelte? see e.g.
-		// hn.svelte.dev
-		// const style = document.querySelector('style[data-svelte]');
-		// if (style) style.remove();
+		const style = document.querySelector('style[data-svelte]');
+		if (style) style.remove();
 
 		this.root = new this.Root({
 			target: this.target,
@@ -310,6 +304,7 @@ export class Renderer {
 		};
 
 		const changed = {
+			path: !this.current.page || page.path !== this.current.page.path,
 			params: Object.keys(page.params).filter((key) => {
 				return !this.current.page || this.current.page.params[key] !== page.params[key];
 			}),
@@ -341,6 +336,7 @@ export class Renderer {
 				const changed_since_last_render =
 					!previous ||
 					module !== previous.module ||
+					(changed.path && previous.uses.path) ||
 					changed.params.some((param) => previous.uses.params.has(param)) ||
 					(changed.query && previous.uses.query) ||
 					(changed.session && previous.uses.session) ||
@@ -366,6 +362,7 @@ export class Renderer {
 							module,
 							uses: {
 								params: new Set(),
+								path: false,
 								query: false,
 								session: false,
 								context: false
@@ -389,8 +386,11 @@ export class Renderer {
 							loaded = await module.load.call(null, {
 								page: {
 									host: page.host,
-									path: page.path,
 									params,
+									get path() {
+										node.uses.path = true;
+										return page.path;
+									},
 									get query() {
 										node.uses.query = true;
 										return page.query;

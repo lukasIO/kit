@@ -2,7 +2,7 @@ import fs from 'fs';
 import glob from 'tiny-glob/sync.js';
 import ports from 'port-authority';
 import fetch from 'node-fetch';
-import { chromium } from 'playwright';
+import { chromium } from 'playwright-chromium';
 import { dev } from '../src/core/dev/index.js';
 import { build } from '../src/core/build/index.js';
 import { start } from '../src/core/start/index.js';
@@ -10,12 +10,28 @@ import { load_config } from '../src/core/load_config/index.js';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 async function setup({ port }) {
+	const base = `http://localhost:${port}`;
+
 	const browser = await chromium.launch();
 
 	const contexts = {
 		js: await browser.newContext({ javaScriptEnabled: true }),
 		nojs: await browser.newContext({ javaScriptEnabled: false })
 	};
+
+	contexts.js.setDefaultTimeout(5000);
+	contexts.nojs.setDefaultTimeout(5000);
+
+	const cookie = {
+		name: 'name',
+		value: 'SvelteKit',
+		domain: base,
+		path: '/',
+		httpOnly: true
+	};
+
+	await contexts.js.addCookies([cookie]);
+	await contexts.nojs.addCookies([cookie]);
 
 	const pages = {
 		js: await contexts.js.newPage(),
@@ -49,7 +65,6 @@ async function setup({ port }) {
 
 		return requests;
 	};
-	const base = `http://localhost:${port}`;
 
 	// Uncomment this for debugging
 	// pages.js.on('console', (msg) => {
