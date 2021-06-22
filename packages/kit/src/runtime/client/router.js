@@ -144,7 +144,7 @@ export class Router {
 		addEventListener('popstate', (event) => {
 			if (event.state && this.enabled) {
 				const url = new URL(location.href);
-				this._navigate(url, event.state['sveltekit:scroll'], []);
+				this._navigate(url, event.state['sveltekit:scroll'], [], location.hash);
 			}
 		});
 
@@ -262,8 +262,7 @@ export class Router {
 		if (scroll) {
 			scrollTo(scroll.x, scroll.y);
 		} else if (deep_linked) {
-			// scroll is an element id (from a hash), we need to compute y
-			scrollTo(0, deep_linked.getBoundingClientRect().top + scrollY);
+			deep_linked.scrollIntoView();
 		} else {
 			scrollTo(0, 0);
 		}
